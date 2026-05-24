@@ -1,0 +1,248 @@
+name: Android Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'           # Trigger saat push tag, contoh: v1.0.0
+  workflow_dispatch:       # Bisa juga trigger manual dari GitHub UI
+    inputs:
+      release_type:
+        description: 'Tipe release (stable / beta / alpha)'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+          - stable
+          - beta
+          - alpha
+      release_notes:
+        description: 'Catatan release tambahan (opsional)'
+        required: false
+        type: string
+
+# ─────────────────────────────────────────────
+# PERMISSIONS
+# ─────────────────────────────────────────────
+permissions:
+  contents: write   # Diperlukan untuk membuat Release
+
+# ─────────────────────────────────────────────
+# ENV GLOBAL
+# ─────────────────────────────────────────────
+env:
+  JAVA_VERSION: '17'
+  BUILD_TOOLS_VERSION: '36.0.1'
+
+jobs:
+
+  # ═══════════════════════════════════════════
+  # JOB 1 — BUILD APK / AAB
+  # ═══════════════════════════════════════════
+  build:
+    name: Build Android App
+    runs-on: ubuntu-latest
+
+    outputs:
+      version_name: ${{ steps.get_version.outputs.version_name }}
+      version_code: ${{ steps.get_version.outputs.version_code }}
+      apk_path:     ${{ steps.find_artifacts.outputs.apk_path }}
+      aab_path:     ${{ steps.find_artifacts.outputs.aab_path }}
+
+    steps:
+
+      # 1. Checkout kode
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Ambil full history untuk changelog
+
+      # 2. Setup JDK
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      # 3. Setup Android SDK (opsional, sudah tersedia di ubuntu-latest)
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 4. Cache Gradle dependencies
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            .gradle
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # 5. Beri permission ke gradlew (jika file wrapper gradlew dicommit)
+      - name: Grant Execute Permission for Gradlew
+        run: |
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+          else
+            echo "Gradlew wrapper tidak ditemukan di root! Membuat wrapper menggunakan gradle..."
+            gradle wrapper
+            chmod +x gradlew
+          fi
+
+      # 6. Ambil versi dari build.gradle / build.gradle.kts
+      - name: Get App Version
+        id: get_version
+        run: |
+          # Ambil versionName dari app/build.gradle.kts
+          VERSION_NAME=$(grep -oP 'versionName\s*=\s*"\K[^"]+' app/build.gradle.kts || \
+                         grep -oP 'versionName\s+"?\K[^\s"]+' app/build.gradle | head -1)
+          VERSION_CODE=$(grep -oP 'versionCode\s*=\s*\K\d+' app/build.gradle.kts || \
+                         grep -oP 'versionCode\s+\K\d+' app/build.gradle | head -1)
+
+          # Fallback ke tag jika tidak ditemukan
+          if [ -z "$VERSION_NAME" ]; then
+            VERSION_NAME="${GITHUB_REF_NAME#v}"
+          fi
+
+          echo "version_name=$VERSION_NAME" >> $GITHUB_OUTPUT
+          echo "version_code=$VERSION_CODE"  >> $GITHUB_OUTPUT
+          echo "version: $VERSION_NAME (code: $VERSION_CODE)"
+
+      # 7. Jalankan unit test
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      # 8. Build Release APK
+      - name: Build Release APK
+        run: ./gradlew assembleRelease --stacktrace
+
+      # 9. Build Release AAB (untuk Play Store)
+      - name: Build Release AAB
+        run: ./gradlew bundleRelease --stacktrace
+
+      # 10. Cari path artifact hasil build
+      - name: Locate Build Artifacts
+        id: find_artifacts
+        run: |
+          APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          AAB=$(find app/build/outputs/bundle/release -name "*.aab" | head -1)
+          echo "apk_path=$APK" >> $GITHUB_OUTPUT
+          echo "aab_path=$AAB" >> $GITHUB_OUTPUT
+          echo "APK: $APK"
+          echo "AAB: $AAB"
+
+      # 11. Upload artifact agar bisa dipakai job berikutnya
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-apk
+          path: ${{ steps.find_artifacts.outputs.apk_path }}
+          retention-days: 7
+
+      - name: Upload AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-aab
+          path: ${{ steps.find_artifacts.outputs.aab_path }}
+          retention-days: 7
+
+  # ═══════════════════════════════════════════
+  # JOB 2 — GENERATE CHANGELOG & PUBLISH RELEASE
+  # ═══════════════════════════════════════════
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build   # Tunggu job build selesai
+
+    steps:
+
+      # 1. Checkout (perlu untuk git log)
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 2. Download artifacts dari job build
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: release-apk
+          path: ./artifacts/apk
+
+      - name: Download AAB
+        uses: actions/download-artifact@v4
+        with:
+          name: release-aab
+          path: ./artifacts/aab
+
+      # 3. Generate changelog otomatis dari git log
+      - name: Generate Changelog
+        id: changelog
+        run: |
+          # Ambil tag sebelumnya
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+
+          echo "Previous tag: $PREV_TAG"
+          echo "Current tag:  $CURRENT_TAG"
+
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log --pretty=format:"- %s (%h)" | head -20)
+          else
+            COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s (%h)")
+          fi
+
+          # Tentukan label tipe release
+          RELEASE_TYPE="${{ github.event.inputs.release_type || 'stable' }}"
+          case "$RELEASE_TYPE" in
+            beta)   TYPE_BADGE="Beta Release"   ;;
+            alpha)  TYPE_BADGE="Alpha Release"  ;;
+            *)      TYPE_BADGE="Release"  ;;
+          esac
+
+          # Ambil custom notes dari manual trigger (jika ada)
+          CUSTOM_NOTES="${{ github.event.inputs.release_notes }}"
+
+          # Susun body release
+          BODY="## $TYPE_BADGE — v${{ needs.build.outputs.version_name }}"$'\n\n'
+
+          if [ -n "$CUSTOM_NOTES" ]; then
+            BODY+="### Catatan Release"$'\n'"$CUSTOM_NOTES"$'\n\n'
+          fi
+
+          BODY+="> **Version Code:** \`${{ needs.build.outputs.version_code }}\`"$'\n'
+          BODY+="> **Commit:** \`${GITHUB_SHA:0:7}\`"$'\n'
+          BODY+="> **Build Date:** \`$(date -u '+%Y-%m-%d %H:%M UTC')\`"$'\n\n'
+          BODY+="---"$'\n\n'
+          BODY+="### Daftar Perubahan"$'\n'"$COMMITS"$'\n'
+
+          # Simpan ke file (hindari masalah newline di env var)
+          echo "$BODY" > release_notes.md
+          echo "Release notes generated"
+          cat release_notes.md
+
+      # 4. Cari file APK & AAB yang sudah didownload
+      - name: Locate Downloaded Artifacts
+        id: locate
+        run: |
+          APK=$(find ./artifacts/apk -name "*.apk" | head -1)
+          AAB=$(find ./artifacts/aab -name "*.aab" | head -1)
+          echo "apk=$APK" >> $GITHUB_OUTPUT
+          echo "aab=$AAB" >> $GITHUB_OUTPUT
+
+      # 5. Buat GitHub Release
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ github.ref_name }}
+          name:       "Release v${{ needs.build.outputs.version_name }}"
+          body_path:  release_notes.md
+          draft:      false
+          prerelease: ${{ github.event.inputs.release_type != 'stable' && github.event.inputs.release_type != '' }}
+          files: |
+            ${{ steps.locate.outputs.apk }}
+            ${{ steps.locate.outputs.aab }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

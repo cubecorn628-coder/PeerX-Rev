@@ -1,0 +1,6 @@
+{
+  "name": "PeerX",
+  "description": "Serverless P2P WebRTC Messenger for Android using Jetpack Compose and Material 3",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
